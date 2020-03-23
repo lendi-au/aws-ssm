@@ -1,0 +1,45 @@
+steps:
+  - label: "Run Build"
+    commands:
+      - make build
+    plugins:
+      - docker#v3.4.0:
+          image: golang:1.14.1-buster
+          workdir: /app
+          volumes:
+            - "/tmp:/tmp"
+          environment:
+            - "NPM_TOKEN"
+            - "BUILDKITE_BRANCH"
+            - "BUILDKITE"
+          propagate-environment: true
+  - label: "Run tests"
+    commands:
+      - make test
+    plugins:
+      - docker#v3.4.0:
+          image: golang:1.14.1-buster
+          workdir: /app
+          volumes:
+            - "/tmp:/tmp"
+          environment:
+            - "NPM_TOKEN"
+            - "BUILDKITE_BRANCH"
+            - "BUILDKITE"
+          propagate-environment: true
+
+
+  - wait
+  - label: ":docker: Push to ECR :docker:"
+    key: pull-request-common
+    branches: "master-lendi"
+    commands:
+      - make container
+      - docker tag cmattoon/aws-ssm:latest aws-ssm:latest
+      - lcd docker:push aws-ssm:latest
+    plugins:
+      - lendi-au/ssm#0.5.2:
+          ssmkey: "NPM_TOKEN"
+      - lendi-au/npm-global#1.1.0:
+          env: "NPM_TOKEN"
+          package: "@lendi/lcd"
