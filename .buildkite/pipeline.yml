@@ -8,10 +8,6 @@ steps:
           workdir: /app
           volumes:
             - "/tmp:/tmp"
-          environment:
-            - "NPM_TOKEN"
-            - "BUILDKITE_BRANCH"
-            - "BUILDKITE"
           propagate-environment: true
   - label: "Run tests"
     commands:
@@ -22,12 +18,7 @@ steps:
           workdir: /app
           volumes:
             - "/tmp:/tmp"
-          environment:
-            - "NPM_TOKEN"
-            - "BUILDKITE_BRANCH"
-            - "BUILDKITE"
           propagate-environment: true
-
 
   - wait
   - label: ":docker: Push to ECR :docker:"
