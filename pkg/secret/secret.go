@@ -16,6 +16,7 @@
 package secret
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -25,6 +26,7 @@ import (
 	anno "github.com/cmattoon/aws-ssm/pkg/annotations"
 	"github.com/cmattoon/aws-ssm/pkg/provider"
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -44,9 +46,11 @@ type Secret struct {
 	ParamValue string
 	// The data to add to Kubernetes Secret Data
 	Data map[string]string
+	// Context for k8s API
+	Context context.Context
 }
 
-func NewSecret(sec v1.Secret, p provider.Provider, secret_name string, secret_namespace string, param_name string, param_type string, param_key string) (*Secret, error) {
+func NewSecret(ctx context.Context, sec v1.Secret, p provider.Provider, secret_name string, secret_namespace string, param_name string, param_type string, param_key string, roleArn string) (*Secret, error) {
 
 	s := &Secret{
 		Secret:     sec,
@@ -57,6 +61,7 @@ func NewSecret(sec v1.Secret, p provider.Provider, secret_name string, secret_na
 		ParamKey:   param_key,
 		ParamValue: "",
 		Data:       map[string]string{},
+		Context:    ctx,
 	}
 
 	log.Debugf("Getting value for '%s/%s'", s.Namespace, s.Name)
@@ -67,13 +72,13 @@ func NewSecret(sec v1.Secret, p provider.Provider, secret_name string, secret_na
 	}
 
 	if s.ParamType == "String" || s.ParamType == "SecureString" {
-		value, err := p.GetParameterValue(s.ParamName, decrypt)
+		value, err := p.GetParameterValue(s.ParamName, decrypt, roleArn)
 		if err != nil {
 			return nil, err
 		}
 		s.ParamValue = value
 	} else if s.ParamType == "StringList" {
-		value, err := p.GetParameterValue(s.ParamName, decrypt)
+		value, err := p.GetParameterValue(s.ParamName, decrypt, roleArn)
 		if err != nil {
 			return nil, err
 		}
@@ -85,7 +90,7 @@ func NewSecret(sec v1.Secret, p provider.Provider, secret_name string, secret_na
 		}
 	} else if s.ParamType == "Directory" {
 		// Directory: Set each sub-key
-		all_params, err := p.GetParameterDataByPath(s.ParamName, decrypt)
+		all_params, err := p.GetParameterDataByPath(s.ParamName, decrypt, roleArn)
 		if err != nil {
 			return nil, err
 		}
@@ -108,10 +113,11 @@ func NewSecret(sec v1.Secret, p provider.Provider, secret_name string, secret_na
 }
 
 // FromKubernetesSecret returns an internal Secret struct, if the v1.Secret is properly annotated.
-func FromKubernetesSecret(p provider.Provider, secret v1.Secret) (*Secret, error) {
+func FromKubernetesSecret(ctx context.Context, p provider.Provider, secret v1.Secret) (*Secret, error) {
 	param_name := ""
 	param_type := ""
 	param_key := ""
+	role := ""
 
 	for k, v := range secret.ObjectMeta.Annotations {
 		switch k {
@@ -121,6 +127,8 @@ func FromKubernetesSecret(p provider.Provider, secret v1.Secret) (*Secret, error
 			param_type = v
 		case anno.AWSParamKey, anno.V1ParamKey:
 			param_key = v
+		case anno.AWSRoleArn, anno.V1RoleArn:
+			role = v
 		}
 	}
 
@@ -130,19 +138,21 @@ func FromKubernetesSecret(p provider.Provider, secret v1.Secret) (*Secret, error
 
 	if param_name != "" && param_type != "" {
 		if param_type == "SecureString" && param_key == "" {
-			log.Info("No KMS key defined. Using default key 'alias/aws/ssm'")
+			log.Debug("No KMS key defined. Using default key 'alias/aws/ssm'")
 			param_key = "alias/aws/ssm"
 		}
 	}
 
 	s, err := NewSecret(
+		ctx,
 		secret,
 		p,
 		secret.ObjectMeta.Name,
 		secret.ObjectMeta.Namespace,
 		param_name,
 		param_type,
-		param_key)
+		param_key,
+		role)
 
 	if err != nil {
 		return nil, err
@@ -183,15 +193,15 @@ func (s *Secret) Set(key string, val string) (err error) {
 	// StringData isn't populated initially, so check s.Data
 	if _, ok := s.Data[key]; ok {
 		// Refuse to overwite existing keys
-		return errors.New(fmt.Sprintf("Key '%s' already exists for Secret %s/%s", key, s.Namespace, s.Name))
+		return fmt.Errorf("Key '%s' already exists for Secret %s/%s", key, s.Namespace, s.Name)
 	}
 	s.Secret.StringData[key] = val
 	return
 }
 
 func (s *Secret) UpdateObject(cli kubernetes.Interface) (result *v1.Secret, err error) {
-	log.Info("Updating Kubernetes Secret...")
-	return cli.CoreV1().Secrets(s.Namespace).Update(&s.Secret)
+	log.Debug("Updating Kubernetes Secret...")
+	return cli.CoreV1().Secrets(s.Namespace).Update(s.Context, &s.Secret, metav1.UpdateOptions{})
 }
 
 func safeKeyName(key string) string {

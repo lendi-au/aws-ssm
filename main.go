@@ -32,7 +32,7 @@ func main() {
 	if err := cfg.ParseFlags(); err != nil {
 		log.Fatalf("Error parsing flags: %v", err)
 	}
-	log.Infof("Using config: %v", cfg)
+	log.Infof("Using config: %+v", cfg)
 
 	stopChan := make(chan struct{}, 1)
 
@@ -41,6 +41,9 @@ func main() {
 
 	ctrl := controller.NewController(cfg)
 
+	if cfg.EnableWatcher {
+		go ctrl.Watch(stopChan)
+	}
 	ctrl.Run(stopChan)
 }
 

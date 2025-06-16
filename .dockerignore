@@ -1,11 +1,11 @@
 .git
 *~
 
+aws-ssm/**
 build/**
 examples/**
 scripts/**
 terraform/**
-vendor/**
 
 CHANGELOG.md
 CODE_OF_CONDUCT.md
@@ -20,4 +20,4 @@ LICENSE
 Makefile
 README.md
 CODE_OF_CONDUCT.md
-
+Dockerfile
