@@ -25,6 +25,7 @@ import (
 	anno "github.com/cmattoon/aws-ssm/pkg/annotations"
 	"github.com/cmattoon/aws-ssm/pkg/provider"
 	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
 
@@ -195,6 +196,26 @@ func (s *Secret) Set(key string, val string) (err error) {
 
 func (s *Secret) UpdateObject(cli kubernetes.Interface) (result *v1.Secret, err error) {
 	log.Info("Updating Kubernetes Secret...")
+
+	// Re-fetch the current version of the secret immediately before calling
+	// Update. The controller builds its work list from a point-in-time List
+	// snapshot; if the secret is deleted and recreated between that snapshot
+	// and this Update call, the stale UID in s.Secret will no longer match
+	// the UID held in etcd, causing:
+	//
+	//   StorageError: invalid object, Code: 4
+	//   Precondition failed: UID in precondition: <old>, UID in object meta: <new>
+	//
+	// By re-fetching we always carry the live ResourceVersion (optimistic
+	// concurrency) and the live UID (precondition check) into the Update.
+	current, getErr := cli.CoreV1().Secrets(s.Namespace).Get(s.Name, metav1.GetOptions{})
+	if getErr != nil {
+		return nil, fmt.Errorf("failed to get current secret %s/%s before update: %v", s.Namespace, s.Name, getErr)
+	}
+
+	s.Secret.ResourceVersion = current.ResourceVersion
+	s.Secret.UID = current.UID
+
 	return cli.CoreV1().Secrets(s.Namespace).Update(&s.Secret)
 }
 
