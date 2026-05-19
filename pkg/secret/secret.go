@@ -27,6 +27,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/retry"
 )
 
 type Secret struct {
@@ -197,26 +198,39 @@ func (s *Secret) Set(key string, val string) (err error) {
 func (s *Secret) UpdateObject(cli kubernetes.Interface) (result *v1.Secret, err error) {
 	log.Info("Updating Kubernetes Secret...")
 
-	// Re-fetch the current version of the secret immediately before calling
-	// Update. The controller builds its work list from a point-in-time List
-	// snapshot; if the secret is deleted and recreated between that snapshot
-	// and this Update call, the stale UID in s.Secret will no longer match
-	// the UID held in etcd, causing:
+	// Wrap the Get+Update in RetryOnConflict to handle the race window between
+	// reading the current ResourceVersion and writing the update.  Kubernetes
+	// uses optimistic concurrency: if any other actor modifies the secret
+	// between our Get and our Update the API server returns HTTP 409 Conflict:
+	//
+	//   the object has been modified; please apply your changes to the latest
+	//   version and try again
+	//
+	// RetryOnConflict detects that error and retries up to 5 times with
+	// exponential back-off (10 ms … 1 s).
+	//
+	// Inside the retry loop we also re-fetch the live ResourceVersion and UID
+	// before every Update attempt.  The controller builds its work list from a
+	// point-in-time List snapshot; if the secret is deleted and recreated
+	// between that snapshot and this call, the stale UID would trigger:
 	//
 	//   StorageError: invalid object, Code: 4
 	//   Precondition failed: UID in precondition: <old>, UID in object meta: <new>
-	//
-	// By re-fetching we always carry the live ResourceVersion (optimistic
-	// concurrency) and the live UID (precondition check) into the Update.
-	current, getErr := cli.CoreV1().Secrets(s.Namespace).Get(s.Name, metav1.GetOptions{})
-	if getErr != nil {
-		return nil, fmt.Errorf("failed to get current secret %s/%s before update: %v", s.Namespace, s.Name, getErr)
-	}
+	retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current, getErr := cli.CoreV1().Secrets(s.Namespace).Get(s.Name, metav1.GetOptions{})
+		if getErr != nil {
+			return fmt.Errorf("failed to get current secret %s/%s before update: %v", s.Namespace, s.Name, getErr)
+		}
 
-	s.Secret.ResourceVersion = current.ResourceVersion
-	s.Secret.UID = current.UID
+		s.Secret.ResourceVersion = current.ResourceVersion
+		s.Secret.UID = current.UID
 
-	return cli.CoreV1().Secrets(s.Namespace).Update(&s.Secret)
+		var updateErr error
+		result, updateErr = cli.CoreV1().Secrets(s.Namespace).Update(&s.Secret)
+		return updateErr
+	})
+
+	return result, retryErr
 }
 
 func safeKeyName(key string) string {
