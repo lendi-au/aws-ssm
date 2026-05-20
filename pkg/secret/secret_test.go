@@ -24,6 +24,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/fake"
 )
 
 func TestParseStringList(t *testing.T) {
@@ -248,6 +250,77 @@ func TestFromKubernetesSecretUsesSpecifiedEncryptionKey(t *testing.T) {
 	if err != nil || ks.ParamKey != "foo/bar/baz" || ks.ParamValue != "FooBar123" {
 		t.Fail()
 	}
+}
+
+// TestUpdateObjectRefetchesUID verifies that UpdateObject re-fetches the
+// current secret before calling Update so that a stale UID (held in the
+// in-memory snapshot from a previous List call) is replaced with the live
+// UID from the API server.  Without the fix this would fail with:
+//
+//	StorageError: invalid object, Code: 4
+//	Precondition failed: UID in precondition: <old>, UID in object meta: <new>
+func TestUpdateObjectRefetchesUID(t *testing.T) {
+	const namespace = "test-ns"
+	const name = "my-secret"
+	const staleUID types.UID = "stale-uid-from-list-snapshot"
+	const currentUID types.UID = "current-uid-after-recreate"
+	const currentRV = "42"
+
+	// The secret that currently lives in the API server (new UID after a
+	// delete+recreate cycle).
+	liveSecret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Namespace:       namespace,
+			UID:             currentUID,
+			ResourceVersion: currentRV,
+		},
+	}
+
+	fakeClient := fake.NewSimpleClientset(liveSecret)
+
+	// Build an internal Secret that carries the *stale* snapshot UID –
+	// exactly the situation that causes the precondition failure.
+	s := &Secret{
+		Name:      name,
+		Namespace: namespace,
+		Secret: v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: namespace,
+				UID:       staleUID, // stale – would trigger UID mismatch without fix
+			},
+			StringData: map[string]string{"mykey": "myvalue"},
+		},
+	}
+
+	result, err := s.UpdateObject(fakeClient)
+	require.NoError(t, err, "UpdateObject should succeed even when the in-memory UID is stale")
+	assert.Equal(t, currentUID, result.UID, "result should carry the live UID")
+	assert.Equal(t, currentRV, result.ResourceVersion, "result should carry the live ResourceVersion")
+	assert.Equal(t, "myvalue", result.StringData["mykey"], "SSM value should be written to the secret")
+}
+
+// TestUpdateObjectReturnsErrorWhenSecretGone verifies that UpdateObject
+// returns a meaningful error when the secret no longer exists (i.e. was
+// deleted and not yet recreated).
+func TestUpdateObjectReturnsErrorWhenSecretGone(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset() // empty – no secrets
+
+	s := &Secret{
+		Name:      "missing-secret",
+		Namespace: "test-ns",
+		Secret: v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "missing-secret",
+				Namespace: "test-ns",
+			},
+		},
+	}
+
+	_, err := s.UpdateObject(fakeClient)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "failed to get current secret")
 }
 
 func TestSafeKeyName(t *testing.T) {
