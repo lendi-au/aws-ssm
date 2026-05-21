@@ -53,34 +53,51 @@ func NewController(cfg *config.Config) *Controller {
 }
 
 func (c *Controller) HandleSecrets(cli kubernetes.Interface) error {
-	secrets, err := cli.CoreV1().Secrets("").List(metav1.ListOptions{})
-	if err != nil {
-		log.Fatalf("Error retrieving secrets: %s", err)
-	}
-
+	// The Kubernetes API server paginates list responses (default page size:
+	// 500). Without explicit pagination the controller would silently process
+	// only the first 500 secrets out of potentially tens of thousands, leaving
+	// the remainder permanently un-synced.  We follow the Continue token until
+	// all pages have been consumed.
+	var continueToken string
 	i, j, k := 0, 0, 0
-	for _, sec := range secrets.Items {
-		i++
 
-		obj, err := secret.FromKubernetesSecret(c.Provider, sec)
+	for {
+		secrets, err := cli.CoreV1().Secrets("").List(metav1.ListOptions{
+			Limit:    500,
+			Continue: continueToken,
+		})
 		if err != nil {
-			// Error: Irrelevant Secret
-			continue
+			log.Fatalf("Error retrieving secrets: %s", err)
 		}
-		j++
 
-		_, err = obj.UpdateObject(cli)
-		if err != nil {
-			log.Warnf("Failed to update object %s/%s", obj.Namespace, obj.Name)
-			log.Warn(err.Error())
-			continue
+		for _, sec := range secrets.Items {
+			i++
+
+			obj, err := secret.FromKubernetesSecret(c.Provider, sec)
+			if err != nil {
+				// Error: Irrelevant Secret
+				continue
+			}
+			j++
+
+			_, err = obj.UpdateObject(cli)
+			if err != nil {
+				log.Warnf("Failed to update object %s/%s", obj.Namespace, obj.Name)
+				log.Warn(err.Error())
+				continue
+			}
+			log.Infof("Successfully updated %s/%s", obj.Namespace, obj.Name)
+			k++
 		}
-		log.Infof("Successfully updated %s/%s", obj.Namespace, obj.Name)
-		k++
+
+		if secrets.Continue == "" {
+			break
+		}
+		continueToken = secrets.Continue
 	}
 
 	log.Infof("Updated %v/%v secrets (of %v total secrets)", k, j, i)
-	return err
+	return nil
 }
 
 func (c *Controller) runOnce() error {
