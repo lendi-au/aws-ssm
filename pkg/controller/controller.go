@@ -63,8 +63,9 @@ func (c *Controller) HandleSecrets(cli kubernetes.Interface) error {
 
 	for {
 		secrets, err := cli.CoreV1().Secrets("").List(metav1.ListOptions{
-			Limit:    500,
-			Continue: continueToken,
+			Limit:           500,
+			Continue:        continueToken,
+			ResourceVersion: "0", // serve from the watch cache; tokens never expire
 		})
 		if err != nil {
 			log.Fatalf("Error retrieving secrets: %s", err)
