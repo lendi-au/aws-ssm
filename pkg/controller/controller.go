@@ -16,6 +16,7 @@
 package controller
 
 import (
+	"os"
 	"time"
 
 	"github.com/cmattoon/aws-ssm/pkg/config"
@@ -53,13 +54,27 @@ func NewController(cfg *config.Config) *Controller {
 }
 
 func (c *Controller) HandleSecrets(cli kubernetes.Interface) error {
+	// When SKIP_POPULATED=true the controller only processes annotated secrets
+	// that have no data yet (DATA=0). This enables a fast-cycle "bootstrap"
+	// instance that catches newly-created empty secrets quickly without
+	// spending time on SSM API calls for secrets that are already populated.
+	// A separate full-cycle instance (SKIP_POPULATED unset) continues to keep
+	// all secrets in sync when SSM parameter values change.
+	skipPopulated := os.Getenv("SKIP_POPULATED") == "true"
+	if skipPopulated {
+		log.Info("SKIP_POPULATED=true: skipping secrets that already have data")
+	}
+
 	// The Kubernetes API server paginates list responses (default page size:
 	// 500). Without explicit pagination the controller would silently process
 	// only the first 500 secrets out of potentially tens of thousands, leaving
 	// the remainder permanently un-synced.  We follow the Continue token until
 	// all pages have been consumed.
+	//
+	// ResourceVersion="0" serves from the API server's watch cache so that
+	// continue tokens never expire mid-pagination (HTTP 410).
 	var continueToken string
-	i, j, k := 0, 0, 0
+	i, j, k, skipped := 0, 0, 0, 0
 
 	for {
 		secrets, err := cli.CoreV1().Secrets("").List(metav1.ListOptions{
@@ -73,6 +88,11 @@ func (c *Controller) HandleSecrets(cli kubernetes.Interface) error {
 
 		for _, sec := range secrets.Items {
 			i++
+
+			if skipPopulated && len(sec.Data) > 0 {
+				skipped++
+				continue
+			}
 
 			obj, err := secret.FromKubernetesSecret(c.Provider, sec)
 			if err != nil {
@@ -97,7 +117,11 @@ func (c *Controller) HandleSecrets(cli kubernetes.Interface) error {
 		continueToken = secrets.Continue
 	}
 
-	log.Infof("Updated %v/%v secrets (of %v total secrets)", k, j, i)
+	if skipPopulated {
+		log.Infof("Updated %v/%v secrets (of %v total secrets, %v already populated and skipped)", k, j, i, skipped)
+	} else {
+		log.Infof("Updated %v/%v secrets (of %v total secrets)", k, j, i)
+	}
 	return nil
 }
 
