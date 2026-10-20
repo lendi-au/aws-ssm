@@ -198,6 +198,29 @@ func (s *Secret) Set(key string, val string) (err error) {
 func (s *Secret) UpdateObject(cli kubernetes.Interface) (result *v1.Secret, err error) {
 	log.Info("Updating Kubernetes Secret...")
 
+	// The controller builds its work list from a point-in-time List snapshot
+	// and NewSecret keeps that snapshot on s.Secret so it can derive the SSM
+	// binding from the listed annotations. That snapshot must never be written
+	// back to the API server verbatim: the list may predate concurrent edits
+	// by other actors (helm/lcd updates to BUILD_LINK, labels, or the
+	// aws-ssm/aws-param-* annotations, for example). A full-object Update of
+	// the listed body restores those stale values and silently reverts the
+	// other actor's change on every poll cycle.
+	//
+	// The only thing this controller owns is the SSM-derived data payload
+	// captured below from StringData (populated during construction). From
+	// here on s.Secret is intentionally ignored: each attempt re-fetches the
+	// live object and applies the payload to it, so concurrent metadata edits
+	// always survive.
+	payload := map[string]string{}
+	for k, v := range s.Secret.StringData {
+		payload[k] = v
+	}
+	if len(payload) == 0 {
+		log.Warnf("Refusing to update secret %s/%s: no SSM data payload was prepared", s.Namespace, s.Name)
+		return nil, fmt.Errorf("no SSM data payload prepared for secret %s/%s", s.Namespace, s.Name)
+	}
+
 	// Wrap the Get+Update in RetryOnConflict to handle the race window between
 	// reading the current ResourceVersion and writing the update.  Kubernetes
 	// uses optimistic concurrency: if any other actor modifies the secret
@@ -209,24 +232,44 @@ func (s *Secret) UpdateObject(cli kubernetes.Interface) (result *v1.Secret, err 
 	// RetryOnConflict detects that error and retries up to 5 times with
 	// exponential back-off (10 ms … 1 s).
 	//
-	// Inside the retry loop we also re-fetch the live ResourceVersion and UID
-	// before every Update attempt.  The controller builds its work list from a
-	// point-in-time List snapshot; if the secret is deleted and recreated
-	// between that snapshot and this call, the stale UID would trigger:
-	//
-	//   StorageError: invalid object, Code: 4
-	//   Precondition failed: UID in precondition: <old>, UID in object meta: <new>
+	// Re-fetching the live object inside the retry loop also refreshes the
+	// UID, keeping the write valid when the secret was deleted and recreated
+	// between the List snapshot and this call.
 	retryErr := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		current, getErr := cli.CoreV1().Secrets(s.Namespace).Get(s.Name, metav1.GetOptions{})
 		if getErr != nil {
 			return fmt.Errorf("failed to get current secret %s/%s before update: %v", s.Namespace, s.Name, getErr)
 		}
 
-		s.Secret.ResourceVersion = current.ResourceVersion
-		s.Secret.UID = current.UID
+		// Skip the write when every payload key already holds the same value
+		// on the live secret. This avoids needless churn across large secret
+		// populations (the full-cycle instance no longer rewrites objects
+		// whose SSM values have not changed) and preserves any other data keys
+		// present on the secret.
+		unchanged := true
+		for k, v := range payload {
+			if string(current.Data[k]) != v {
+				unchanged = false
+				break
+			}
+		}
+		if unchanged {
+			log.Debugf("Secret %s/%s is already up to date; skipping update", s.Namespace, s.Name)
+			result = current
+			return nil
+		}
+
+		desired := current.DeepCopy()
+		if desired.Data == nil {
+			desired.Data = map[string][]byte{}
+		}
+		for k, v := range payload {
+			desired.Data[k] = []byte(v)
+		}
+		desired.StringData = nil
 
 		var updateErr error
-		result, updateErr = cli.CoreV1().Secrets(s.Namespace).Update(&s.Secret)
+		result, updateErr = cli.CoreV1().Secrets(s.Namespace).Update(desired)
 		return updateErr
 	})
 

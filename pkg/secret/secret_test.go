@@ -19,6 +19,7 @@ import (
 	//"reflect"
 	"testing"
 
+	anno "github.com/cmattoon/aws-ssm/pkg/annotations"
 	"github.com/cmattoon/aws-ssm/pkg/provider"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -298,7 +299,132 @@ func TestUpdateObjectRefetchesUID(t *testing.T) {
 	require.NoError(t, err, "UpdateObject should succeed even when the in-memory UID is stale")
 	assert.Equal(t, currentUID, result.UID, "result should carry the live UID")
 	assert.Equal(t, currentRV, result.ResourceVersion, "result should carry the live ResourceVersion")
-	assert.Equal(t, "myvalue", result.StringData["mykey"], "SSM value should be written to the secret")
+	assert.Equal(t, "myvalue", string(result.Data["mykey"]), "SSM value should be written to the secret")
+	assert.Empty(t, result.StringData, "StringData should not survive the update")
+}
+
+// TestUpdateObjectRebasesOnLiveObject verifies that UpdateObject applies the
+// SSM data payload onto the *live* secret rather than writing the List
+// snapshot back to the API server. A stale snapshot (annotations, labels, or
+// other data keys changed by another actor after the list was taken) must be
+// preserved — historically the controller reverted such changes on every poll.
+func TestUpdateObjectRebasesOnLiveObject(t *testing.T) {
+	const namespace = "test-ns"
+	const name = "my-secret"
+
+	// The secret that currently lives in the API server. Its annotations and
+	// extra data key were written by another actor (helm) *after* our List
+	// snapshot was taken, so the in-memory snapshot below is stale.
+	liveSecret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Namespace:       namespace,
+			UID:             "live-uid",
+			ResourceVersion: "42",
+			Annotations: map[string]string{
+				"BUILD_LINK":                "https://buildkite.example/builds/209",
+				anno.AWSParamName:           "/aurora/tools/amplitude/deployment-key",
+				anno.AWSParamType:           "SecureString",
+				"meta.helm.sh/release-name": "app-secrets",
+			},
+		},
+		Data: map[string][]byte{
+			"SecureString":   []byte("live-ssm-value"),
+			"kafka-password": []byte("keep-me"),
+		},
+	}
+
+	fakeClient := fake.NewSimpleClientset(liveSecret)
+
+	// In-memory snapshot from an earlier List: stale annotations and missing
+	// the other actor's data key.
+	s := &Secret{
+		Name:      name,
+		Namespace: namespace,
+		Secret: v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      name,
+				Namespace: namespace,
+				Annotations: map[string]string{
+					"BUILD_LINK":      "https://buildkite.example/builds/186",
+					anno.AWSParamName: "/aurora-dev/tools/amplitude/deployment-key-server",
+					anno.AWSParamType: "SecureString",
+				},
+			},
+			StringData: map[string]string{"SecureString": "fresh-ssm-value"},
+		},
+	}
+
+	result, err := s.UpdateObject(fakeClient)
+	require.NoError(t, err)
+
+	// Data value replaced with the SSM payload...
+	assert.Equal(t, "fresh-ssm-value", string(result.Data["SecureString"]))
+	// ...unmanaged data keys preserved...
+	assert.Equal(t, "keep-me", string(result.Data["kafka-password"]))
+	// ...and the live metadata untouched: the other actor's BUILD_LINK and
+	// aws-ssm param-name survive instead of being reverted to the snapshot.
+	assert.Equal(t, "https://buildkite.example/builds/209", result.Annotations["BUILD_LINK"])
+	assert.Equal(t, "/aurora/tools/amplitude/deployment-key", result.Annotations[anno.AWSParamName])
+}
+
+// TestUpdateObjectSkipsWhenAlreadyUpToDate verifies the no-op fast path: when
+// the payload value is already present on the live secret, no Update should be
+// issued at all.
+func TestUpdateObjectSkipsWhenAlreadyUpToDate(t *testing.T) {
+	const namespace = "test-ns"
+	const name = "my-secret"
+
+	liveSecret := &v1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            name,
+			Namespace:       namespace,
+			UID:             "live-uid",
+			ResourceVersion: "7",
+		},
+		Data: map[string][]byte{
+			"SecureString": []byte("unchanged-value"),
+		},
+	}
+
+	fakeClient := fake.NewSimpleClientset(liveSecret)
+
+	s := &Secret{
+		Name:      name,
+		Namespace: namespace,
+		Secret: v1.Secret{
+			StringData: map[string]string{"SecureString": "unchanged-value"},
+		},
+	}
+
+	result, err := s.UpdateObject(fakeClient)
+	require.NoError(t, err)
+	assert.Equal(t, "7", result.ResourceVersion, "no write should occur when the payload is already present")
+
+	actions := fakeClient.Actions()
+	for _, a := range actions {
+		assert.NotEqual(t, "update", a.GetVerb(), "expected no update action for an unchanged secret")
+	}
+}
+
+// TestUpdateObjectRefusesEmptyPayload verifies that UpdateObject refuses to
+// run when no SSM data was prepared (e.g. StringData was never populated by
+// the provider), instead of writing an empty object over live secrets.
+func TestUpdateObjectRefusesEmptyPayload(t *testing.T) {
+	fakeClient := fake.NewSimpleClientset() // empty – nothing even reachable
+
+	s := &Secret{
+		Name:      "some-secret",
+		Namespace: "test-ns",
+		Secret: v1.Secret{
+			ObjectMeta: metav1.ObjectMeta{Name: "some-secret", Namespace: "test-ns"},
+			// No StringData: no payload.
+		},
+	}
+
+	_, err := s.UpdateObject(fakeClient)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no SSM data payload prepared")
 }
 
 // TestUpdateObjectReturnsErrorWhenSecretGone verifies that UpdateObject
@@ -314,6 +440,9 @@ func TestUpdateObjectReturnsErrorWhenSecretGone(t *testing.T) {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "missing-secret",
 				Namespace: "test-ns",
+			},
+			StringData: map[string]string{
+				"SecureString": "some-value",
 			},
 		},
 	}
